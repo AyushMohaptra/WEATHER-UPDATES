@@ -1,0 +1,45 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on tags like v1.0, v1.1
+
+permissions:
+  contents: write # REQUIRED: Allows the script to upload the binary to the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+
+      - name: Install ESP8266 Core
+        run: |
+          arduino-cli config init
+          arduino-cli core update-index --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core install esp8266:esp8266 --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+
+      - name: Install Libraries
+        run: |
+          arduino-cli lib install "Adafruit BMP280 Library"
+          arduino-cli lib install "DHT sensor library"
+          arduino-cli lib install "ThingSpeak"
+          arduino-cli lib install "Adafruit Unified Sensor"
+
+      - name: Compile Sketch
+        run: |
+          # Finds your .ino file automatically in the root folder
+          # Compiles it for NodeMCU v2 (ESP8266)
+          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 --output-dir ./build --build-property "build.project_name=firmware" .
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./build/firmware.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
