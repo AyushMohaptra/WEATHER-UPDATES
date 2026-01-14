@@ -13,6 +13,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
 #include <DHT.h>
+#include <ESP8266WebServer.h>
 #include <math.h>
 #include "secrets.h"
 
@@ -46,6 +47,12 @@ Adafruit_BMP280 bmp;
 WiFiClient client;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", TIME_OFFSET);
+ESP8266WebServer webServer(80);
+
+// Debug logging
+#define LOG_SIZE 30
+String debugLog[LOG_SIZE];
+int logIdx = 0;
 
 // --- GLOBAL VARIABLES ---
 float pressureHistory[HISTORY_SIZE];
@@ -61,6 +68,12 @@ unsigned long lastSlowScan = 0;
 unsigned long lastLog = 0;
 unsigned long lastHistory = 0;
 unsigned long lastOTACheck = 0;
+// Add this near your other timers
+unsigned long lastWifiRetry = 0;
+const unsigned long wifiRetryInterval = 60000; // Retry every 1 minute
+// ThingSpeak rate limiting (15s free-tier)
+unsigned long lastThingSpeakWrite = 0;
+const unsigned long thingSpeakInterval = 15000; // milliseconds
 
 // CPU Overclocking
 extern "C" { 
@@ -74,9 +87,12 @@ void saveConfigCallback () {
 }
 
 // --- FUNCTION PROTOTYPES ---
-void uploadToThingSpeak(float bmpVal, float dhtVal, float h, float p, int z, float ah, float dp, int wifiRssi, int secondsAgo);
+int uploadToThingSpeak(float bmpVal, float dhtVal, float h, float p, int z, float ah, float dp, int wifiRssi, int secondsAgo);
 int calculateZambretti(float currentP);
 void checkForOTAUpdate();
+void addLog(String msg);
+void handleDebug();
+void handleLogs();
 
 // --- SETUP ---
 void setup() {
@@ -135,6 +151,9 @@ void setup() {
   }
 
   Serial.println("\nWiFi Connected!");
+  WiFi.setAutoReconnect(true); 
+  WiFi.persistent(true);
+  WiFi.mode(WIFI_STA);
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 
   // 4. SAVE NEW CONFIG (If changed)
@@ -157,7 +176,11 @@ void setup() {
   }
 
   // 5. HARDWARE & TIME INIT
+  Serial.println("Initializing DHT sensor...");
   dht.begin();
+  delay(2000); // DHT11 needs time to stabilize after power-up
+  Serial.println("DHT sensor initialized");
+  
   if (!bmp.begin(0x76)) { if (!bmp.begin(0x77)) Serial.println("Error: BMP280 missing"); }
   
   timeClient.begin();
@@ -168,21 +191,53 @@ void setup() {
   ArduinoOTA.setHostname("WeatherSentinel-Pro");
   ArduinoOTA.setPassword("admin123"); 
   ArduinoOTA.begin();
+  
+  // 6b. WEB DEBUG SERVER
+  webServer.on("/", handleDebug);
+  webServer.on("/logs", handleLogs);
+  webServer.begin();
+  addLog("Debug server started at http://" + WiFi.localIP().toString());
 
   // 7. PRINT CURRENT FIRMWARE VERSION
   Serial.print("Current Firmware Version: ");
   Serial.println(FIRMWARE_VERSION);
 
+  // 8. WARMUP & PRIME SENSORS (Prevent 0 values on reset)
+  Serial.println("Warming up sensors...");
+  
+  // Force first readings so variables aren't 0
+  float checkH = dht.readHumidity();
+  float checkT = dht.readTemperature();
+  
+  // Only save if valid (not NaN)
+  if (!isnan(checkH) && !isnan(checkT)) {
+    currentHum = checkH;
+    currentDhtTemp = checkT;
+    Serial.print("Initial DHT Temp: "); Serial.print(currentDhtTemp);
+    Serial.print("°C, Humidity: "); Serial.print(currentHum); Serial.println("%");
+  } else {
+    Serial.println("Sensor warmup failed (will retry in loop)");
+  }
+  
+  // Prime the BMP280 accumulators too so they aren't empty
+  tempSum += bmp.readTemperature();
+  pressSum += (bmp.readPressure() / 100.0F);
+  sampleCount = 1;
+  Serial.println("Sensor priming complete!");
+
   // Reset timers
   lastLog = millis() - 300000;      
   lastSlowScan = millis() - 30000;
   lastHistory = millis() - 600000;
-  lastOTACheck = millis() - 3600000; // Check for updates 1 hour after boot
+  lastOTACheck = millis() - 3600000; // Check for updates immediately after boot
+  // Allow first ThingSpeak upload immediately
+  lastThingSpeakWrite = millis() - thingSpeakInterval;
 }
 
 // --- MAIN LOOP ---
 void loop() {
-  ArduinoOTA.handle(); 
+  ArduinoOTA.handle();
+  webServer.handleClient(); 
 
   unsigned long now = millis();
 
@@ -199,7 +254,20 @@ void loop() {
     lastSlowScan = now;
     float h = dht.readHumidity();
     float t = dht.readTemperature();
-    if (!isnan(h)) { currentHum = h; currentDhtTemp = t; }
+    
+    Serial.print("DHT Reading - Humidity: ");
+    Serial.print(h);
+    Serial.print("%, Temperature: ");
+    Serial.print(t);
+    Serial.println("°C");
+    
+    if (!isnan(h) && !isnan(t)) { 
+      currentHum = h; 
+      currentDhtTemp = t;
+      Serial.println("DHT reading successful!");
+    } else {
+      Serial.println("ERROR: DHT sensor returned NaN! Check wiring and power.");
+    }
     wifiStrength = WiFi.RSSI(); // Get WiFi signal strength
   }
 
@@ -218,42 +286,81 @@ void loop() {
       checkForOTAUpdate();
     }
   }
-
-  // Upload (5m)
-  if (now - lastLog >= 300000) {
+  // --- START OF IMPROVED UPLOAD & RECONNECT BLOCK ---
+  if (now - lastLog >= 300000) { // 5 Minute Cycle
     lastLog = now;
+    
+    // Check if we need to force a reconnect
+    if (WiFi.status() != WL_CONNECTED) {
+      if (now - lastWifiRetry >= wifiRetryInterval) {
+        lastWifiRetry = now;
+        addLog("WiFi Down - Forcing Reconnect...");
+        WiFi.reconnect(); // Attempt immediate reconnect
+      }
+    }
+
     if (sampleCount > 0) {
       float avgTemp = (tempSum / sampleCount) + TEMP_OFFSET;
       float avgPress = pressSum / sampleCount;
-      float safeHum = (currentHum == 0) ? 1.0 : currentHum; 
+      float safeHum = (currentHum == 0) ? 1.0 : currentHum;
       float dewPoint = avgTemp - ((100 - safeHum) / 5.0);
       float absHum = (6.112 * exp((17.67 * avgTemp)/(avgTemp+243.5)) * safeHum * 2.1674) / (273.15 + avgTemp);
       int forecastCode = calculateZambretti(avgPress);
 
-      if (WiFi.status() == WL_CONNECTED) {
-          timeClient.update();
-          uploadToThingSpeak(avgTemp, currentDhtTemp, currentHum, avgPress, forecastCode, absHum, dewPoint, wifiStrength, 0);
+          if (WiFi.status() == WL_CONNECTED) {
+              timeClient.update();
+              // 1. Upload Current Data (respect ThingSpeak 15s free-tier limit)
+              if (millis() - lastThingSpeakWrite >= thingSpeakInterval) {
+                int resp = uploadToThingSpeak(avgTemp, currentDhtTemp, currentHum, avgPress, forecastCode, absHum, dewPoint, wifiStrength, 0);
+                lastThingSpeakWrite = millis();
+                if (resp == 200) {
+                  addLog("Current data sent.");
+                } else {
+                  addLog("ThingSpeak current upload failed: " + String(resp) + " - buffering");
+                  // Re-buffer current data
+                  if (bufferCount < BUFFER_SIZE) {
+                  offlineBuffer[bufferCount] = {avgTemp, currentDhtTemp, currentHum, avgPress, forecastCode, absHum, dewPoint};
+                  bufferCount++;
+                  } else {
+                  // Buffer full: drop oldest, add newest
+                  for (int i = 0; i < BUFFER_SIZE - 1; i++) offlineBuffer[i] = offlineBuffer[i+1];
+                  offlineBuffer[BUFFER_SIZE - 1] = {avgTemp, currentDhtTemp, currentHum, avgPress, forecastCode, absHum, dewPoint};
+                  }
+                }
+              } else {
+                addLog("Skipping current ThingSpeak upload due to rate limit");
+              }
 
-          if (bufferCount > 0) {
-             for (int i = bufferCount - 1; i >= 0; i--) {
-                 unsigned long startWait = millis();
-                 while(millis() - startWait < 16000) { ArduinoOTA.handle(); yield(); }
-                 
-                 WeatherData old = offlineBuffer[i];
-                 int lagSeconds = (bufferCount - i) * 300;
-                 uploadToThingSpeak(old.temp, old.dhtTemp, old.hum, old.press, old.zambretti, old.absHum, old.dewPoint, wifiStrength, lagSeconds);
-                 bufferCount--;
-             }
-          }
+              // 2. Upload ONE buffered item per cycle (only if rate limit allows)
+              if (bufferCount > 0) {
+               if (millis() - lastThingSpeakWrite >= thingSpeakInterval) {
+                 WeatherData old = offlineBuffer[0]; // Get oldest
+                 int lagSeconds = bufferCount * 300; // Calculate how old it is
+                 int respOld = uploadToThingSpeak(old.temp, old.dhtTemp, old.hum, old.press, old.zambretti, old.absHum, old.dewPoint, wifiStrength, lagSeconds);
+                 if (respOld == 200) {
+                   lastThingSpeakWrite = millis();
+                   // Shift buffer down by 1
+                   for (int i = 0; i < bufferCount - 1; i++) {
+                     offlineBuffer[i] = offlineBuffer[i+1];
+                   }
+                   bufferCount--;
+                   addLog("Sent 1 buffered record. Remaining: " + String(bufferCount));
+                 } else {
+                   addLog("Buffered ThingSpeak upload failed: " + String(respOld));
+                 }
+               } else {
+                 addLog("Buffered upload deferred due to ThingSpeak rate limit");
+               }
+              }
       } else {
-          // Offline Save
+          addLog("WiFi offline - buffering data");
           if (bufferCount < BUFFER_SIZE) {
              offlineBuffer[bufferCount] = {avgTemp, currentDhtTemp, currentHum, avgPress, forecastCode, absHum, dewPoint};
              bufferCount++;
           } else {
+             // Buffer full: drop oldest, add newest
              for (int i = 0; i < BUFFER_SIZE - 1; i++) offlineBuffer[i] = offlineBuffer[i+1];
              offlineBuffer[BUFFER_SIZE - 1] = {avgTemp, currentDhtTemp, currentHum, avgPress, forecastCode, absHum, dewPoint};
-             bufferCount = BUFFER_SIZE;
           }
       }
       tempSum = 0; pressSum = 0; sampleCount = 0;
@@ -262,15 +369,16 @@ void loop() {
 }
 
 // --- HELPER FUNCTION ---
-void uploadToThingSpeak(float bmpVal, float dhtVal, float h, float p, int z, float ah, float dp, int wifiRssi, int secondsAgo) {
-     ThingSpeak.setField(1, bmpVal);      
-     ThingSpeak.setField(2, h);           
-     ThingSpeak.setField(3, p);           
-     ThingSpeak.setField(4, z);           
-     ThingSpeak.setField(5, ah);          
-     ThingSpeak.setField(6, dp);          
-     ThingSpeak.setField(7, dhtVal);      
-     ThingSpeak.setField(8, wifiRssi);      
+int uploadToThingSpeak(float bmpVal, float dhtVal, float h, float p, int z, float ah, float dp, int wifiRssi, int secondsAgo) {
+     // Only set fields with non-zero values (keeps graphs clean)
+     if (bmpVal != 0) ThingSpeak.setField(1, bmpVal);      
+     if (h != 0) ThingSpeak.setField(2, h);           
+     if (p != 0) ThingSpeak.setField(3, p);           
+     ThingSpeak.setField(4, z); // Zambretti can be 0          
+     if (ah != 0) ThingSpeak.setField(5, ah);          
+     if (dp != 0) ThingSpeak.setField(6, dp);          
+     if (dhtVal != 0) ThingSpeak.setField(7, dhtVal);      
+     ThingSpeak.setField(8, wifiRssi); // RSSI can be negative      
 
      if (secondsAgo > 0) {
         unsigned long nowEpoch = timeClient.getEpochTime();
@@ -284,10 +392,12 @@ void uploadToThingSpeak(float bmpVal, float dhtVal, float h, float p, int z, flo
      
      // CONVERT Char Array to Long for ThingSpeak
      unsigned long channelNum = atol(thingSpeakChannelId);
-     ThingSpeak.writeFields(channelNum, thingSpeakApiKey);
-     
-     // Simple Success Check
-     Serial.println("Data sent to ThingSpeak (Check Dashboard)");
+  int response = ThingSpeak.writeFields(channelNum, thingSpeakApiKey);
+  // yield to keep WDT happy
+  yield();
+  // Log response
+  Serial.println("ThingSpeak response: " + String(response));
+  return response;
 }
 
 int calculateZambretti(float currentP) {
@@ -362,4 +472,57 @@ void checkForOTAUpdate() {
   }
   
   http.end();
+}
+
+// --- DEBUG LOGGING ---
+void addLog(String msg) {
+  Serial.println(msg);
+  debugLog[logIdx] = String(millis()/1000) + "s: " + msg;
+  logIdx = (logIdx + 1) % LOG_SIZE;
+}
+
+void handleDebug() {
+  webServer.handleClient();
+  String html = "<html><head><meta http-equiv='refresh' content='5'><style>";
+  html += "body{font-family:monospace;background:#000;color:#0f0;padding:20px;}";
+  html += "h1{color:#0f0;}div{margin:5px 0;}</style></head><body>";
+  html += "<h1>Weather Debug</h1>";
+  html += "<div>Uptime: " + String(millis()/1000) + "s | Temp: " + String(currentDhtTemp) + " | Hum: " + String(currentHum) + "</div>";
+  html += "<h2>Recent Logs:</h2>";
+  for(int i=0; i<LOG_SIZE; i++) {
+    int idx = (logIdx + i) % LOG_SIZE;
+    if(debugLog[idx].length() > 0) html += "<div>" + debugLog[idx] + "</div>";
+  }
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+void handleLogs() {
+  // Return JSON containing logs, buffer metadata and basic status
+  DynamicJsonDocument doc(2048);
+  doc["uptime_s"] = millis() / 1000;
+  doc["firmware"] = String(FIRMWARE_VERSION);
+  doc["wifi_rssi"] = wifiStrength;
+  doc["wifi_status"] = WiFi.status();
+  doc["buffer_count"] = bufferCount;
+  doc["buffer_size"] = BUFFER_SIZE;
+  JsonArray logs = doc.createNestedArray("logs");
+  for (int i = 0; i < LOG_SIZE; i++) {
+    int idx = (logIdx + i) % LOG_SIZE;
+    if (debugLog[idx].length() > 0) logs.add(debugLog[idx]);
+  }
+  JsonArray buffer = doc.createNestedArray("buffer");
+  for (int i = 0; i < bufferCount; i++) {
+    JsonObject e = buffer.createNestedObject();
+    e["temp"] = offlineBuffer[i].temp;
+    e["dhtTemp"] = offlineBuffer[i].dhtTemp;
+    e["hum"] = offlineBuffer[i].hum;
+    e["press"] = offlineBuffer[i].press;
+    e["zambretti"] = offlineBuffer[i].zambretti;
+    e["absHum"] = offlineBuffer[i].absHum;
+    e["dewPoint"] = offlineBuffer[i].dewPoint;
+  }
+  String out;
+  serializeJson(doc, out);
+  webServer.send(200, "application/json", out);
 }
